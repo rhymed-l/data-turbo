@@ -158,7 +158,13 @@ public class BatchDeleteInterceptor implements Interceptor {
                                 .build();
                         String deleteSql = RowNumberSqlParser.getRowNumberPageSql(boundSql.getSql(), pageConfig, pageResult);
                         log.debug("[{}] 生成的删除 SQL: {}", threadName, deleteSql);
-                        BoundSql deleteBoundSql = new BoundSql(ms.getConfiguration(), deleteSql, boundSql.getParameterMappings(), parameter);
+
+                        // 使用 getParameters 方法处理参数映射,确保参数数量匹配
+                        BoundSql deleteBoundSql = new BoundSql(ms.getConfiguration(), deleteSql,
+                                getParameters(deleteSql, boundSql.getParameterMappings()), parameter);
+
+                        // 复制原 BoundSql 的额外参数（包括 foreach 生成的动态参数）
+                        copyAdditionalParameters(boundSql, deleteBoundSql);
 
                         // 创建新的 MappedStatement 用于执行删除
                         MappedStatement deleteMs = MappedStatementUtils.copyFromMappedStatement(ms, ms.getId() + "_batch_delete_" + pageResult.getPageNum(), deleteBoundSql);
@@ -272,6 +278,10 @@ public class BatchDeleteInterceptor implements Interceptor {
             // 这里分页后会去掉参数 所以重新解析参数设置
             BoundSql countBoundSql =
                     new BoundSql(ms.getConfiguration(), countSql, this.getParameters(countSql, boundSql.getParameterMappings()), parameter);
+
+            // 复制原 BoundSql 的额外参数（包括 foreach 生成的动态参数）
+            copyAdditionalParameters(boundSql, countBoundSql);
+
             MappedStatement finalCountMs = customCountMs;
             pageResults = executor.query(finalCountMs, parameter, RowBounds.DEFAULT, null, countKey, countBoundSql);
         } else {
@@ -332,23 +342,22 @@ public class BatchDeleteInterceptor implements Interceptor {
         int sqlParamCount = countParameters(sql);
         int mappingCount = parameterMappings.size();
 
+        log.debug("参数映射分析: SQL中的'?'数量={}, ParameterMapping数量={}", sqlParamCount, mappingCount);
+
         // 如果参数数量一致,直接返回
         if (sqlParamCount == mappingCount) {
             return parameterMappings;
         }
 
-        // 如果 SQL 中的参数更少,从后面截取
-        if (sqlParamCount < mappingCount) {
-            int diff = mappingCount - sqlParamCount;
-            List<ParameterMapping> result = new ArrayList<>(sqlParamCount);
-            for (int i = diff; i < mappingCount; i++) {
-                result.add(parameterMappings.get(i));
-            }
-            return result;
+        // 参数数量不一致时记录警告
+        if (sqlParamCount != mappingCount) {
+            log.warn("参数数量不一致! SQL中的'?'数量={}, ParameterMapping数量={}. " +
+                            "将尝试使用原始参数映射,依赖MyBatis的additionalParameters机制处理动态参数",
+                    sqlParamCount, mappingCount);
         }
 
-        // 如果 SQL 中的参数更多(例如 foreach 展开),直接返回原参数
-        // MyBatis 会自动处理参数展开
+        // 直接返回原始参数映射,让 MyBatis 通过 additionalParameters 处理
+        // foreach 等动态SQL的参数会通过 additionalParameters 传递,不在 ParameterMapping 中
         return parameterMappings;
     }
 
@@ -363,5 +372,28 @@ public class BatchDeleteInterceptor implements Interceptor {
         }
 
         return count;
+    }
+
+    /**
+     * 复制 BoundSql 的额外参数（包括 foreach 生成的动态参数）
+     */
+    private void copyAdditionalParameters(BoundSql source, BoundSql target) {
+        try {
+            // 通过反射获取 additionalParameters 字段
+            java.lang.reflect.Field additionalParametersField = BoundSql.class.getDeclaredField("additionalParameters");
+            additionalParametersField.setAccessible(true);
+
+            @SuppressWarnings("unchecked")
+            java.util.Map<String, Object> sourceParams = (java.util.Map<String, Object>) additionalParametersField.get(source);
+
+            if (sourceParams != null && !sourceParams.isEmpty()) {
+                for (java.util.Map.Entry<String, Object> entry : sourceParams.entrySet()) {
+                    target.setAdditionalParameter(entry.getKey(), entry.getValue());
+                }
+                log.debug("复制了 {} 个额外参数", sourceParams.size());
+            }
+        } catch (Exception e) {
+            log.warn("复制额外参数失败，可能导致动态SQL参数丢失", e);
+        }
     }
 }
