@@ -329,16 +329,27 @@ public class BatchDeleteInterceptor implements Interceptor {
     }
 
     private List<ParameterMapping> getParameters(String sql, List<ParameterMapping> parameterMappings) {
-        int diff = parameterMappings.size() - countParameters(sql);
-        if (diff == 0) {
+        int sqlParamCount = countParameters(sql);
+        int mappingCount = parameterMappings.size();
+
+        // 如果参数数量一致,直接返回
+        if (sqlParamCount == mappingCount) {
             return parameterMappings;
         }
 
-        List<ParameterMapping> result;
-        for (result = new ArrayList<>(parameterMappings.size()); diff < parameterMappings.size(); diff++) {
-            result.add(parameterMappings.get(diff));
+        // 如果 SQL 中的参数更少,从后面截取
+        if (sqlParamCount < mappingCount) {
+            int diff = mappingCount - sqlParamCount;
+            List<ParameterMapping> result = new ArrayList<>(sqlParamCount);
+            for (int i = diff; i < mappingCount; i++) {
+                result.add(parameterMappings.get(i));
+            }
+            return result;
         }
-        return result;
+
+        // 如果 SQL 中的参数更多(例如 foreach 展开),直接返回原参数
+        // MyBatis 会自动处理参数展开
+        return parameterMappings;
     }
 
     private int countParameters(String sql) {
