@@ -15,6 +15,7 @@ import net.sf.jsqlparser.schema.Table;
 import net.sf.jsqlparser.statement.Statement;
 import net.sf.jsqlparser.statement.delete.Delete;
 import net.sf.jsqlparser.statement.select.*;
+import net.sf.jsqlparser.statement.update.Update;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -50,6 +51,11 @@ public class RowNumberSqlParser {
             Delete delete = (Delete) stmt;
             addPageConditionToDelete(delete, config, pageResult);
             return delete.toString();
+        } else if (stmt instanceof Update) {
+            // 如果是 UPDATE 语句，直接在 UPDATE 上添加分页条件
+            Update update = (Update) stmt;
+            addPageConditionToUpdate(update, config, pageResult);
+            return update.toString();
         } else if (stmt instanceof Select) {
             // 如果是 SELECT 语句，使用原来的逻辑
             Select select = (Select) stmt;
@@ -88,6 +94,34 @@ public class RowNumberSqlParser {
         }
     }
 
+    /**
+     * 在 UPDATE 语句上添加分页条件（BETWEEN ... AND ...）
+     */
+    private static void addPageConditionToUpdate(Update update, PageConfig config, PageResult pageResult) {
+        String name = config.getPrimaryId();
+        // 如果没指定主键ID，尝试从表名获取
+        if (StrUtil.isBlank(name)) {
+            Table table = update.getTable();
+            String alias = table.getAlias() != null ? table.getAlias().getName() : null;
+            name = StrUtil.isBlank(alias) ? "id" : alias + ".id";
+        }
+
+        // 构建 BETWEEN 条件
+        Between between = new Between();
+        between.setLeftExpression(new Column(name));
+        between.setBetweenExpressionStart(new LongValue(pageResult.getStartKey()));
+        between.setBetweenExpressionEnd(new LongValue(pageResult.getEndKey()));
+
+        // 将 BETWEEN 条件添加到 WHERE 子句
+        if (update.getWhere() == null) {
+            update.setWhere(between);
+        } else {
+            Expression where = update.getWhere();
+            AndExpression andExpression = new AndExpression(where, between);
+            update.setWhere(andExpression);
+        }
+    }
+
 
     public static Select getStatement(String sql) {
         Statement stmt;
@@ -103,6 +137,9 @@ public class RowNumberSqlParser {
         // 如果是 DELETE 语句，转换为 SELECT 语句
         if (stmt instanceof Delete) {
             select = convertDeleteToSelect((Delete) stmt);
+        } else if (stmt instanceof Update) {
+            // 如果是 UPDATE 语句，转换为 SELECT 语句
+            select = convertUpdateToSelect((Update) stmt);
         } else if (stmt instanceof Select) {
             select = (Select) stmt;
         } else {
@@ -143,6 +180,35 @@ public class RowNumberSqlParser {
         // 复制 JOIN（如果有）
         if (delete.getJoins() != null) {
             plainSelect.setJoins(delete.getJoins());
+        }
+
+        Select select = new Select();
+        select.setSelectBody(plainSelect);
+
+        return select;
+    }
+
+    /**
+     * 将 UPDATE 语句转换为 SELECT 语句
+     * UPDATE table SET ... WHERE ... -> SELECT * FROM table WHERE ...
+     */
+    private static Select convertUpdateToSelect(Update update) {
+        PlainSelect plainSelect = new PlainSelect();
+
+        // 设置 SELECT *
+        plainSelect.addSelectItems(new AllColumns());
+
+        // 复制 FROM 子句
+        plainSelect.setFromItem(update.getTable());
+
+        // 复制 WHERE 条件
+        if (update.getWhere() != null) {
+            plainSelect.setWhere(update.getWhere());
+        }
+
+        // 复制 JOIN（如果有）
+        if (update.getJoins() != null) {
+            plainSelect.setJoins(update.getJoins());
         }
 
         Select select = new Select();

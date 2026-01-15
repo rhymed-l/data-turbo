@@ -1,0 +1,406 @@
+package cn.rhymed.data.turbo.interceptor;
+
+import cn.rhymed.data.turbo.RowNumberSqlParser;
+import cn.rhymed.data.turbo.config.BatchUpdateConfig;
+import cn.rhymed.data.turbo.config.PageConfig;
+import cn.rhymed.data.turbo.context.BatchUpdateContext;
+import cn.rhymed.data.turbo.domain.PageResult;
+import cn.rhymed.data.turbo.utils.MappedStatementUtils;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.ibatis.cache.CacheKey;
+import org.apache.ibatis.executor.BatchResult;
+import org.apache.ibatis.executor.Executor;
+import org.apache.ibatis.mapping.BoundSql;
+import org.apache.ibatis.mapping.MappedStatement;
+import org.apache.ibatis.mapping.ParameterMapping;
+import org.apache.ibatis.plugin.Interceptor;
+import org.apache.ibatis.plugin.Intercepts;
+import org.apache.ibatis.plugin.Invocation;
+import org.apache.ibatis.plugin.Signature;
+import org.apache.ibatis.session.ExecutorType;
+import org.apache.ibatis.session.RowBounds;
+import org.apache.ibatis.session.SqlSession;
+import org.apache.ibatis.session.SqlSessionFactory;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import static cn.rhymed.data.turbo.constants.CommonConstants.CUSTOM_ROW_NUMBER_SQL_POSTFIX;
+
+/**
+ * 批量更新拦截器
+ *
+ * @author rhymed.liu[rhymed.liu@anker-in.com]
+ * @since 2025-01-15
+ **/
+@Slf4j
+@Intercepts(
+        {
+                @Signature(type = Executor.class, method = "update", args = {MappedStatement.class, Object.class})
+        }
+)
+@RequiredArgsConstructor
+public class BatchUpdateInterceptor implements Interceptor {
+
+
+    private final SqlSessionFactory sqlSessionFactory;
+
+    @Override
+    public Object intercept(Invocation invocation) throws Throwable {
+        BatchUpdateConfig batchUpdateConfig = BatchUpdateContext.getConfig();
+        // 只有获取到批量更新的配置才处理
+        if (batchUpdateConfig == null) {
+            return invocation.proceed();
+        }
+
+        long startTime = System.currentTimeMillis();
+        try {
+            Object[] args = invocation.getArgs();
+            MappedStatement ms = (MappedStatement) args[0];
+            Object parameter = args[1];
+            Executor executor = (Executor) invocation.getTarget();
+            BoundSql boundSql = ms.getBoundSql(parameter);
+
+            log.info("批量更新拦截器启动");
+            log.info("配置参数: primaryId={}, fetchSize={}, batchSize={}, maxThreadCount={}",
+                    batchUpdateConfig.getPrimaryId(),
+                    batchUpdateConfig.getFetchSize(),
+                    batchUpdateConfig.getBatchSize(),
+                    batchUpdateConfig.getMaxThreadCount());
+            log.info("原始 SQL: {}", boundSql.getSql());
+
+            //获取分页配置信息（通过窗口函数查询）
+            List<PageResult> pageResults = doGetPageConfig(ms, parameter, executor, boundSql, batchUpdateConfig);
+            // 获取到分页数据就可以清空上下文了
+            BatchUpdateContext.clearConfig();
+
+            // 如果小于等于1页，直接执行原更新操作
+            if (pageResults.size() <= 1) {
+                log.info("数据量较小（<=1页），使用普通更新模式");
+                int result = (int) invocation.proceed();
+                long duration = System.currentTimeMillis() - startTime;
+                log.info("更新完成，共更新 {} 条记录，耗时 {} ms", result, duration);
+                return result;
+            }
+
+            // 执行多线程批量更新
+            int result = doBatchUpdate(ms, parameter, boundSql, batchUpdateConfig, pageResults);
+            long duration = System.currentTimeMillis() - startTime;
+            log.info("批量更新全部完成！总更新 {} 条记录，总耗时 {} ms (约 {} 秒)",
+                    result, duration, duration / 1000.0);
+            return result;
+        } catch (Exception e) {
+            long duration = System.currentTimeMillis() - startTime;
+            log.error("批量更新失败，已耗时 {} ms", duration, e);
+            throw e;
+        } finally {
+            // 这里是兜底再清空一次
+            BatchUpdateContext.clearConfig();
+        }
+    }
+
+    private int doBatchUpdate(MappedStatement ms,
+                              Object parameter,
+                              BoundSql boundSql,
+                              BatchUpdateConfig batchUpdateConfig,
+                              List<PageResult> pageResults) throws Exception {
+        int poolSize = Math.min(pageResults.size(), batchUpdateConfig.getMaxThreadCount());
+        ExecutorService executorService = Executors.newFixedThreadPool(poolSize);
+        List<CompletableFuture<Integer>> futures = new ArrayList<>();
+
+        // 将 PageResult 分配到各个线程，每个线程处理多个 PageResult
+        int pageSize = pageResults.size();
+        int pagePerThread = (pageSize + poolSize - 1) / poolSize; // 向上取整
+
+        for (int i = 0; i < poolSize; i++) {
+            int startIdx = i * pagePerThread;
+            int endIdx = Math.min(startIdx + pagePerThread, pageSize);
+            if (startIdx >= pageSize) {
+                break;
+            }
+            List<PageResult> threadPages = pageResults.subList(startIdx, endIdx);
+            final int threadIndex = i + 1;
+
+            log.info("分配任务到线程 #{}: 处理第 {} 到第 {} 页（共 {} 页）",
+                    threadIndex, startIdx + 1, endIdx, threadPages.size());
+
+            CompletableFuture<Integer> future = CompletableFuture.supplyAsync(() -> {
+                long threadStartTime = System.currentTimeMillis();
+                String threadName = Thread.currentThread().getName();
+                log.info("[{}] 线程 #{} 启动，开始处理 {} 个分页", threadName, threadIndex, threadPages.size());
+
+                // 每个线程使用独立的 SqlSession，不自动提交
+                try (SqlSession sqlSession = sqlSessionFactory.openSession(ExecutorType.BATCH, false)) {
+                    int totalUpdated = 0;
+                    int uncommittedCount = 0;
+                    int processedPages = 0;
+                    int commitCount = 0;
+
+                    // 获取 SqlSession 的 Executor
+                    Executor threadExecutor = getExecutor(sqlSession);
+
+                    for (PageResult pageResult : threadPages) {
+                        processedPages++;
+                        log.debug("[{}] 处理第 {}/{} 页: startKey={}, endKey={}, pageSize={}",
+                                threadName, processedPages, threadPages.size(),
+                                pageResult.getStartKey(), pageResult.getEndKey(), pageResult.getPageSize());
+
+                        // 构建带分页条件的更新 SQL
+                        PageConfig pageConfig = PageConfig.builder()
+                                .primaryId(batchUpdateConfig.getPrimaryId())
+                                .pageSize(batchUpdateConfig.getFetchSize())
+                                .build();
+                        String updateSql = RowNumberSqlParser.getRowNumberPageSql(boundSql.getSql(), pageConfig, pageResult);
+                        log.debug("[{}] 生成的更新 SQL: {}", threadName, updateSql);
+
+                        // 使用 getParameters 方法处理参数映射,确保参数数量匹配
+                        BoundSql updateBoundSql = new BoundSql(ms.getConfiguration(), updateSql,
+                                getParameters(updateSql, boundSql.getParameterMappings()), parameter);
+
+                        // 复制原 BoundSql 的额外参数（包括 foreach 生成的动态参数）
+                        copyAdditionalParameters(boundSql, updateBoundSql);
+
+                        // 创建新的 MappedStatement 用于执行更新
+                        MappedStatement updateMs = MappedStatementUtils.copyFromMappedStatement(ms, ms.getId() + "_batch_update_" + pageResult.getPageNum(), updateBoundSql);
+
+                        // 执行更新操作（直接使用 Executor，不需要注册 MappedStatement）
+                        threadExecutor.update(updateMs, parameter);
+
+                        // 估算本次更新影响的行数（用于判断是否需要提交）
+                        int estimatedAffected = pageResult.getPageSize() != null ? pageResult.getPageSize() : batchUpdateConfig.getFetchSize();
+                        uncommittedCount += estimatedAffected;
+
+                        // 按 batchSize 提交事务
+                        if (uncommittedCount >= batchUpdateConfig.getBatchSize()) {
+                            commitCount++;
+                            // 刷新批次并获取实际影响行数
+                            List<BatchResult> batchResults = sqlSession.flushStatements();
+                            int actualAffected = countAffectedRows(batchResults);
+                            totalUpdated += actualAffected;
+                            sqlSession.commit();
+                            log.info("[{}] 第 {} 次事务提交，实际更新 {} 条，累计更新 {} 条",
+                                    threadName, commitCount, actualAffected, totalUpdated);
+                            uncommittedCount = 0;
+                        }
+                    }
+
+                    // 提交剩余的更新操作
+                    if (uncommittedCount > 0) {
+                        commitCount++;
+                        List<BatchResult> batchResults = sqlSession.flushStatements();
+                        int actualAffected = countAffectedRows(batchResults);
+                        totalUpdated += actualAffected;
+                        sqlSession.commit();
+                        log.info("[{}] 最终事务提交，实际更新 {} 条，累计更新 {} 条",
+                                threadName, actualAffected, totalUpdated);
+                    }
+
+                    long threadDuration = System.currentTimeMillis() - threadStartTime;
+                    log.info("[{}] 线程 #{} 完成！处理了 {} 页，共更新 {} 条记录，共提交 {} 次事务，耗时 {} ms",
+                            threadName, threadIndex, processedPages, totalUpdated, commitCount, threadDuration);
+
+                    return totalUpdated;
+                } catch (Exception e) {
+                    long threadDuration = System.currentTimeMillis() - threadStartTime;
+                    log.error("[{}] 线程 #{} 执行失败，已耗时 {} ms", threadName, threadIndex, threadDuration, e);
+                    throw new RuntimeException("批量更新失败", e);
+                }
+            }, executorService);
+
+            futures.add(future);
+        }
+
+        log.info("所有线程已启动，等待执行完成...");
+
+        // 等待所有任务完成
+        CompletableFuture<Void> allOf = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+        try {
+            allOf.get();
+            log.info("所有线程执行完成，开始汇总结果...");
+        } catch (Exception e) {
+            log.error("批量更新任务执行失败", e);
+            throw new RuntimeException("批量更新任务执行失败", e);
+        } finally {
+            executorService.shutdown();
+        }
+
+        // 汇总所有线程的更新数量
+        int totalUpdated = 0;
+        for (int i = 0; i < futures.size(); i++) {
+            int threadUpdated = futures.get(i).get();
+            totalUpdated += threadUpdated;
+            log.info("线程 #{} 更新数量: {}", i + 1, threadUpdated);
+        }
+
+        log.info("----------------------------------------");
+        log.info("批量更新统计: 使用 {} 个线程，处理 {} 个分页，总共更新 {} 条记录",
+                poolSize, pageSize, totalUpdated);
+        log.info("----------------------------------------");
+        return totalUpdated;
+    }
+
+    private List<PageResult> doGetPageConfig(MappedStatement ms,
+                                             Object parameter,
+                                             Executor executor,
+                                             BoundSql boundSql,
+                                             BatchUpdateConfig batchUpdateConfig) throws Exception {
+        long startTime = System.currentTimeMillis();
+
+        MappedStatement customCountMs = null;
+        try {
+            customCountMs = ms.getConfiguration().getMappedStatement(ms.getId() + CUSTOM_ROW_NUMBER_SQL_POSTFIX);
+        } catch (Exception e) {
+            //ignore
+        }
+
+        List<PageResult> pageResults;
+
+        if (customCountMs == null) {
+            CacheKey countKey = executor.createCacheKey(ms, parameter, RowBounds.DEFAULT, boundSql);
+            countKey.update(CUSTOM_ROW_NUMBER_SQL_POSTFIX);
+            //根据当前的 ms 创建一个返回值为 PageResult 类型的 ms
+            customCountMs = MappedStatementUtils.newRowNumberMappedStatement(ms);
+            //调用方言获取 row number sql
+            PageConfig pageConfigInfo = PageConfig.builder()
+                    .primaryId(batchUpdateConfig.getPrimaryId())
+                    .pageSize(batchUpdateConfig.getFetchSize())
+                    .build();
+            String countSql = RowNumberSqlParser.getRowNumberSql(boundSql.getSql(), pageConfigInfo);
+            log.info("将 UPDATE 语句转换为查询分页的 SELECT 语句");
+            log.debug("生成的窗口函数 SQL: {}", countSql);
+
+            // 这里分页后会去掉参数 所以重新解析参数设置
+            BoundSql countBoundSql =
+                    new BoundSql(ms.getConfiguration(), countSql, this.getParameters(countSql, boundSql.getParameterMappings()), parameter);
+
+            // 复制原 BoundSql 的额外参数（包括 foreach 生成的动态参数）
+            copyAdditionalParameters(boundSql, countBoundSql);
+
+            MappedStatement finalCountMs = customCountMs;
+            pageResults = executor.query(finalCountMs, parameter, RowBounds.DEFAULT, null, countKey, countBoundSql);
+        } else {
+            pageResults = executor.query(customCountMs, parameter, RowBounds.DEFAULT, null);
+        }
+
+        long duration = System.currentTimeMillis() - startTime;
+        log.info("分页信息查询完成，共 {} 页，耗时 {} ms", pageResults.size(), duration);
+
+        // 打印分页详情
+        if (log.isDebugEnabled() && !pageResults.isEmpty()) {
+            log.debug("分页详情:");
+            for (int i = 0; i < Math.min(pageResults.size(), 5); i++) {
+                PageResult pr = pageResults.get(i);
+                log.debug("  第 {} 页: startKey={}, endKey={}, pageSize={}",
+                        i + 1, pr.getStartKey(), pr.getEndKey(), pr.getPageSize());
+            }
+            if (pageResults.size() > 5) {
+                log.debug("  ... 还有 {} 页", pageResults.size() - 5);
+            }
+        }
+
+        return pageResults;
+    }
+
+
+    /**
+     * 获取 SqlSession 的 Executor
+     */
+    private Executor getExecutor(SqlSession sqlSession) {
+        try {
+            // 通过反射获取 SqlSession 的 executor 字段
+            java.lang.reflect.Field executorField = sqlSession.getClass().getDeclaredField("executor");
+            executorField.setAccessible(true);
+            return (Executor) executorField.get(sqlSession);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to get executor from SqlSession", e);
+        }
+    }
+
+    /**
+     * 计算 BatchResult 中实际影响的行数
+     */
+    private int countAffectedRows(List<BatchResult> batchResults) {
+        int total = 0;
+        for (BatchResult batchResult : batchResults) {
+            int[] updateCounts = batchResult.getUpdateCounts();
+            for (int count : updateCounts) {
+                if (count > 0) {
+                    total += count;
+                }
+            }
+        }
+        return total;
+    }
+
+    private List<ParameterMapping> getParameters(String sql, List<ParameterMapping> parameterMappings) {
+        int sqlParamCount = countParameters(sql);
+        int mappingCount = parameterMappings.size();
+
+        if (log.isDebugEnabled()) {
+            log.debug("参数映射分析: SQL中的'?'数量={}, ParameterMapping数量={}", sqlParamCount, mappingCount);
+            log.debug("ParameterMapping 详情:");
+            for (int i = 0; i < parameterMappings.size(); i++) {
+                ParameterMapping pm = parameterMappings.get(i);
+                log.debug("  [{}] property={}, javaType={}", i, pm.getProperty(), pm.getJavaType());
+            }
+        }
+
+        // 如果参数数量一致,直接返回
+        if (sqlParamCount == mappingCount) {
+            return parameterMappings;
+        }
+
+        // 参数数量不一致时记录信息(这在使用动态SQL如foreach时是正常的)
+        if (sqlParamCount != mappingCount) {
+            log.debug("参数数量不一致: SQL中的'?'数量={}, ParameterMapping数量={}. " +
+                            "这在使用动态SQL(如foreach)或参数复用时是正常的,将依赖MyBatis的additionalParameters机制处理",
+                    sqlParamCount, mappingCount);
+        }
+
+        // 直接返回原始参数映射,让 MyBatis 通过 additionalParameters 处理
+        // foreach 等动态SQL的参数会通过 additionalParameters 传递,不在 ParameterMapping 中
+        return parameterMappings;
+    }
+
+    private int countParameters(String sql) {
+        // 定义正则表达式来匹配 ?
+        Pattern pattern = Pattern.compile("\\?");
+        Matcher matcher = pattern.matcher(sql);
+
+        int count = 0;
+        while (matcher.find()) {
+            count++;
+        }
+
+        return count;
+    }
+
+    /**
+     * 复制 BoundSql 的额外参数（包括 foreach 生成的动态参数）
+     */
+    private void copyAdditionalParameters(BoundSql source, BoundSql target) {
+        try {
+            // 通过反射获取 additionalParameters 字段
+            java.lang.reflect.Field additionalParametersField = BoundSql.class.getDeclaredField("additionalParameters");
+            additionalParametersField.setAccessible(true);
+
+            @SuppressWarnings("unchecked")
+            java.util.Map<String, Object> sourceParams = (java.util.Map<String, Object>) additionalParametersField.get(source);
+
+            if (sourceParams != null && !sourceParams.isEmpty()) {
+                for (java.util.Map.Entry<String, Object> entry : sourceParams.entrySet()) {
+                    target.setAdditionalParameter(entry.getKey(), entry.getValue());
+                }
+                log.debug("复制了 {} 个额外参数", sourceParams.size());
+            }
+        } catch (Exception e) {
+            log.warn("复制额外参数失败，可能导致动态SQL参数丢失", e);
+        }
+    }
+}
