@@ -342,17 +342,24 @@ public class BatchDeleteInterceptor implements Interceptor {
         int sqlParamCount = countParameters(sql);
         int mappingCount = parameterMappings.size();
 
-        log.debug("参数映射分析: SQL中的'?'数量={}, ParameterMapping数量={}", sqlParamCount, mappingCount);
+        if (log.isDebugEnabled()) {
+            log.debug("参数映射分析: SQL中的'?'数量={}, ParameterMapping数量={}", sqlParamCount, mappingCount);
+            log.debug("ParameterMapping 详情:");
+            for (int i = 0; i < parameterMappings.size(); i++) {
+                ParameterMapping pm = parameterMappings.get(i);
+                log.debug("  [{}] property={}, javaType={}", i, pm.getProperty(), pm.getJavaType());
+            }
+        }
 
         // 如果参数数量一致,直接返回
         if (sqlParamCount == mappingCount) {
             return parameterMappings;
         }
 
-        // 参数数量不一致时记录警告
+        // 参数数量不一致时记录信息(这在使用动态SQL如foreach时是正常的)
         if (sqlParamCount != mappingCount) {
-            log.warn("参数数量不一致! SQL中的'?'数量={}, ParameterMapping数量={}. " +
-                            "将尝试使用原始参数映射,依赖MyBatis的additionalParameters机制处理动态参数",
+            log.debug("参数数量不一致: SQL中的'?'数量={}, ParameterMapping数量={}. " +
+                            "这在使用动态SQL(如foreach)或参数复用时是正常的,将依赖MyBatis的additionalParameters机制处理",
                     sqlParamCount, mappingCount);
         }
 
