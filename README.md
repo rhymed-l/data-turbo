@@ -1,15 +1,18 @@
-# Data Turbo - MyBatis 批量删除拦截器
+# Data Turbo - MyBatis 批量数据处理工具
 
-基于 MyBatis 拦截器实现的高性能批量删除工具，支持多线程并发删除、分批提交事务，适用于大数据量删除场景。
+基于 MyBatis 拦截器实现的高性能批量数据处理工具，支持批量删除、批量更新和批量查询，适用于大数据量操作场景。
+
+> 📖 **详细使用指南**：完整的配置说明、使用示例和最佳实践请查看 [USAGE.md](USAGE.md)
 
 ## 核心特性
 
 - ✅ **自动配置**：Spring Boot 项目开箱即用，无需手动注册
-- ✅ **多线程并发删除**：利用多线程提升删除效率
-- ✅ **分批事务提交**：按指定大小分批提交，避免长事务
+- ✅ **批量删除**：多线程并发删除、分批提交事务，提升删除效率
+- ✅ **批量更新**：多线程并发更新、分批提交事务，提升更新效率
+- ✅ **批量查询**：分批查询 + 回调处理，避免大数据量 OOM，保证快照一致性
 - ✅ **窗口函数分页**：使用 ROW_NUMBER() 窗口函数智能分页
 - ✅ **零侵入设计**：通过拦截器实现，无需修改现有 Mapper 代码
-- ✅ **线程安全**：每个线程独立 SqlSession 和 Transaction
+- ✅ **线程安全**：删除/更新每个线程独立 SqlSession 和 Transaction
 
 ## 快速开始
 
@@ -30,13 +33,14 @@
 
 **Spring Boot 项目无需任何配置，拦截器会自动注册！**
 
-只需引入依赖，Spring Boot 会自动扫描并注册 `BatchDeleteInterceptor`。
+只需引入依赖，Spring Boot 会自动扫描并注册 `BatchDeleteInterceptor`、`BatchUpdateInterceptor` 和 `BatchSelectInterceptor`。
 
 启动日志会显示：
 
 ```
 BatchDeleteInterceptor 已自动注册到 SqlSessionFactory: DefaultSqlSessionFactory
-Data Turbo 默认配置: primaryId=null, fetchSize=5000, batchSize=50000, maxThreadCount=3
+BatchUpdateInterceptor 已自动注册到 SqlSessionFactory: DefaultSqlSessionFactory
+BatchSelectInterceptor 已自动注册到 SqlSessionFactory: DefaultSqlSessionFactory
 ```
 
 #### 2.1 可选：自定义默认配置
@@ -50,6 +54,14 @@ data-turbo:
     fetch-size: 5000            # 默认每批次查询大小，默认 5000
     batch-size: 50000           # 默认每批次提交大小，默认 50000
     max-thread-count: 3         # 默认最大线程数，默认 3
+  batch-update:
+    primary-id: id
+    fetch-size: 5000
+    batch-size: 50000
+    max-thread-count: 3
+  batch-select:
+    primary-id: id              # 默认主键字段
+    fetch-size: 5000            # 默认每批次查询大小
 ```
 
 **内置默认值**（不配置时使用）：
@@ -448,6 +460,99 @@ clearConfig();
 | SQL Server | 2012+ | 完全支持                  |
 | MySQL 5.7  | ❌     | 不支持窗口函数               |
 
+## 批量查询（Batch Select）
+
+批量查询通过分批加载数据 + 回调处理的方式，**避免大数据量 OOM**。所有分页查询在**同一事务内**串行执行，依赖 MySQL
+REPEATABLE READ 保证快照一致性。
+
+### 核心设计
+
+| 特性         | 说明                                        |
+|------------|-------------------------------------------|
+| **快照一致性**  | 同一事务内 REPEATABLE READ，所有分页数据 == 事务开始时刻的数据 |
+| **原子性**    | 任意一批回调抛异常 → `@Transactional` 回滚整个事务       |
+| **避免 OOM** | 每批数据加载到内存、处理完、GC 回收，不会一次性加载全量数据           |
+
+### 使用方式
+
+#### 方式一：回调处理（推荐，省内存）
+
+```java
+import cn.rhymed.data.turbo.BatchSelectHelper;
+
+@Service
+public class UserService {
+
+    @Autowired
+    private UserMapper userMapper;
+
+    @Transactional  // 必须在事务中使用，保证快照一致性和原子性
+    public void processAllUsers() {
+        // 使用默认配置，分批查询并通过回调处理
+        BatchSelectHelper.execute(() -> userMapper.list(), batch -> {
+            // batch 是当前这一批的数据，处理完即释放
+            batch.forEach(user -> sendEmail(user));
+        });
+    }
+
+    @Transactional
+    public void processWithCustomConfig() {
+        // 自定义配置
+        BatchSelectConfig config = BatchSelectConfig.builder()
+                .primaryId("user_id")
+                .fetchSize(1000)
+                .build();
+
+        BatchSelectHelper.execute(config, () -> userMapper.list(), batch -> {
+            batch.forEach(user -> userMapper.updateStatus(user.getId(), "processed"));
+        });
+    }
+}
+```
+
+#### 方式二：收集全部结果（方便但内存占用大）
+
+```java
+@Transactional
+public void processAllUsers() {
+    // 收集所有结果到一个 List（大数据量时慎用）
+    List<User> allUsers = BatchSelectHelper.executeAndCollect(() -> userMapper.list());
+    // 然后做业务处理
+}
+```
+
+### 与原始查询的等价性
+
+```java
+// 原始写法（大数据量会 OOM）
+List<User> all = userMapper.list();
+all.forEach(user -> sendEmail(user));
+
+// 批量查询写法（等价于上面，但不会 OOM）
+BatchSelectHelper.execute(() -> userMapper.list(), batch -> {
+    batch.forEach(user -> sendEmail(user));
+});
+```
+
+**数据保证：**
+
+- 回调处理的总数据量 = 一次查询出来的全部数据
+- 数据内容完全一致（同一事务快照读）
+- 唯一区别：返回值是 `void`，数据通过回调流式处理
+
+### BatchSelectConfig 参数
+
+| 参数        | 类型     | 必填 | 说明              |
+|-----------|--------|----|-----------------|
+| primaryId | String | 否  | 主键字段名，不配置则自动推断  |
+| fetchSize | int    | 否  | 每批次查询大小，默认 5000 |
+
+### ⚠️ 批量查询注意事项
+
+1. **必须在 `@Transactional` 中使用**：保证快照一致性和原子性
+2. **回调中的异常会触发整体回滚**：任意一批处理失败 → 事务回滚 → 整体失败
+3. **不支持多线程**：为保证事务一致性，所有分页在同一连接内串行执行
+
 ## 性能参考
 
 测试环境：MySQL 8.0，8 核 CPU，数据库连接池大小 20
@@ -552,18 +657,40 @@ MappedStatement ID: com.example.mapper.UserMapper.deleteByStatus
 
 ### Q4: 可以用于 UPDATE 操作吗？
 
-**A:** 当前版本仅支持 DELETE 操作。如需支持 UPDATE，可以参考实现自行扩展。
+**A:** 支持。使用 `BatchUpdateHelper.execute()` 即可，用法与批量删除一致。
 
-### Q5: fetchSize 和 batchSize 有什么区别？
+### Q5: 批量查询为什么要用回调而不是直接返回 List？
+
+**A:** 批量查询的核心目标是**避免 OOM**。如果返回 List，所有数据最终还是会加载到内存中，失去了分批的意义。通过回调（Consumer），每批数据处理完即可被
+GC 回收。
+
+### Q6: fetchSize 和 batchSize 有什么区别？
 
 **A:**
 
 - `fetchSize`: 窗口函数分页大小，决定每个 PageResult 的数据范围（影响分页数量）
-- `batchSize`: 事务提交阈值，累计删除这么多数据后提交一次事务（影响事务大小）
+- `batchSize`: 事务提交阈值，累计删除/更新这么多数据后提交一次事务（影响事务大小）
 
 建议配置：`batchSize >= fetchSize`，通常设置为 `fetchSize` 的 5-10 倍。
 
+## 📚 文档导航
+
+| 文档                     | 说明                               |
+|------------------------|----------------------------------|
+| [README.md](README.md) | 项目概览、快速开始、工作原理、FAQ               |
+| [USAGE.md](USAGE.md)   | **详细使用指南**：完整配置说明、使用示例、场景建议、故障排查 |
+
 ## 版本历史
+
+### v1.0.5 (2026-06-01)
+
+- ✅ 新增批量查询（BatchSelectHelper）：分批查询 + 回调处理，避免大数据量 OOM
+- ✅ 批量查询保证快照一致性（同一事务 REPEATABLE READ）
+- ✅ 批量查询保证原子性（@Transactional 回滚）
+
+### v1.0.4 (2026-01-15)
+
+- ✅ 新增批量更新（BatchUpdateHelper）：多线程并发更新
 
 ### v1.0.0 (2025-12-10)
 
@@ -581,7 +708,7 @@ MIT License
 ## 联系作者
 
 - Author: rhymed.liu
-- Email: rhymed.liu@anker-in.com
+- Email: me@rhymed.cn
 
 ---
 

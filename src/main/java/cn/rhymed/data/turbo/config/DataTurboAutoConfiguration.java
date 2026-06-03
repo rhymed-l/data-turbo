@@ -1,8 +1,10 @@
 package cn.rhymed.data.turbo.config;
 
 import cn.rhymed.data.turbo.BatchDeleteHelper;
+import cn.rhymed.data.turbo.BatchSelectHelper;
 import cn.rhymed.data.turbo.BatchUpdateHelper;
 import cn.rhymed.data.turbo.interceptor.BatchDeleteInterceptor;
+import cn.rhymed.data.turbo.interceptor.BatchSelectInterceptor;
 import cn.rhymed.data.turbo.interceptor.BatchUpdateInterceptor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.ibatis.session.SqlSessionFactory;
@@ -17,7 +19,7 @@ import java.util.List;
 
 /**
  * Data Turbo 自动配置类
- * 自动注册 BatchDeleteInterceptor 和 BatchUpdateInterceptor 到所有 SqlSessionFactory
+ * 自动注册 BatchDeleteInterceptor、BatchUpdateInterceptor 和 BatchSelectInterceptor 到所有 SqlSessionFactory
  *
  * @author rhymed.liu[rhymed.liu@anker-in.com]
  * @since 2025-12-10
@@ -45,6 +47,7 @@ public class DataTurboAutoConfiguration {
         DataTurboProperties properties = dataTurboProperties();
         BatchDeleteHelper.setProperties(properties);
         BatchUpdateHelper.setProperties(properties);
+        BatchSelectHelper.setProperties(properties);
 
         if (sqlSessionFactories == null || sqlSessionFactories.isEmpty()) {
             log.warn("未找到 SqlSessionFactory，拦截器未注册");
@@ -63,6 +66,12 @@ public class DataTurboAutoConfiguration {
             sqlSessionFactory.getConfiguration().addInterceptor(updateInterceptor);
             log.info("BatchUpdateInterceptor 已自动注册到 SqlSessionFactory: {}",
                     sqlSessionFactory.getClass().getSimpleName());
+
+            // 注册批量查询拦截器
+            BatchSelectInterceptor selectInterceptor = new BatchSelectInterceptor();
+            sqlSessionFactory.getConfiguration().addInterceptor(selectInterceptor);
+            log.info("BatchSelectInterceptor 已自动注册到 SqlSessionFactory: {}",
+                    sqlSessionFactory.getClass().getSimpleName());
         }
 
         // 打印批量删除配置信息
@@ -78,5 +87,10 @@ public class DataTurboAutoConfiguration {
                 properties.getBatchUpdate().getFetchSize(),
                 properties.getBatchUpdate().getBatchSize(),
                 properties.getBatchUpdate().getMaxThreadCount());
+
+        // 打印批量查询配置信息
+        log.info("BatchSelect 默认配置: primaryId={}, fetchSize={}",
+                properties.getBatchSelect().getPrimaryId(),
+                properties.getBatchSelect().getFetchSize());
     }
 }

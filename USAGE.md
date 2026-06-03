@@ -1,6 +1,8 @@
 # Data Turbo 使用指南
 
-## 🚀 三步开始使用
+Data Turbo 是一个基于 MyBatis 拦截器的批量数据处理工具，支持**批量删除**、**批量更新**和**批量查询**。
+
+## 🚀 快速开始
 
 ### 第一步：添加依赖
 
@@ -11,7 +13,7 @@
 <dependency>
     <groupId>cn.rhymed</groupId>
     <artifactId>data-turbo</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.5</version>
 </dependency>
 ```
 
@@ -26,25 +28,36 @@ data-turbo:
     fetch-size: 5000            # 默认每批次查询大小，默认 5000
     batch-size: 50000           # 默认每批次提交大小，默认 50000
     max-thread-count: 3         # 默认最大线程数，默认 3
+  batch-update:
+    primary-id: id
+    fetch-size: 5000
+    batch-size: 50000
+    max-thread-count: 3
+  batch-select:
+    primary-id: id              # 默认主键字段
+    fetch-size: 5000            # 默认每批次查询大小
 ```
 
 **如果不配置**，将使用以下内置默认值：
 
 - `primaryId`: `null`（自动推断为 "id" 或 "表别名.id"）
 - `fetchSize`: `5000`
-- `batchSize`: `50000`
-- `maxThreadCount`: `3`
+- `batchSize`: `50000`（删除/更新专用）
+- `maxThreadCount`: `3`（删除/更新专用）
 
 启动 Spring Boot 应用，查看日志：
 
 ```
 BatchDeleteInterceptor 已自动注册到 SqlSessionFactory: DefaultSqlSessionFactory
-Data Turbo 默认配置: primaryId=null, fetchSize=5000, batchSize=50000, maxThreadCount=3
+BatchUpdateInterceptor 已自动注册到 SqlSessionFactory: DefaultSqlSessionFactory
+BatchSelectInterceptor 已自动注册到 SqlSessionFactory: DefaultSqlSessionFactory
 ```
 
-看到这些日志说明拦截器已自动注册成功，并显示了当前使用的默认配置。
+看到这些日志说明拦截器已自动注册成功。
 
-### 第三步：使用批量删除
+### 第三步：使用批量删除/更新/查询
+
+#### 批量删除
 
 有两种使用方式：
 
@@ -327,7 +340,7 @@ spring:
 
 ## ⚠️ 重要提示
 
-### 1. 不要在 @Transactional 中使用
+### 1. 不要在 @Transactional 中使用（批量删除/更新）
 
 ```java
 // ❌ 错误示例
@@ -343,6 +356,38 @@ public void deleteUsers() {
     userMapper.deleteByStatus("expired");
 }
 ```
+
+**为什么不能用 @Transactional？**
+
+批量删除/更新内部使用**多线程 + 独立的 SqlSession**，每个线程会：
+
+1. 从连接池获取一个数据库连接
+2. 开启独立的事务（不受 Spring 的 @Transactional 管理）
+3. 按 batchSize 分批提交（如每 5000 条 commit 一次）
+
+**场景演示**：假设删除 15000 条数据，batchSize=5000
+
+```
+第 1 批：删除 5000 条 → 已 commit ✅
+第 2 批：删除 5000 条 → 已 commit ✅
+第 3 批：删除 5000 条 → 失败抛异常 ❌
+```
+
+此时前 10000 条已经提交到数据库，**无法回滚**。而外层的 @Transactional 只能回滚它管理的那个连接，但拦截器内部用的是自己开的
+SqlSession，Spring 管不到。
+
+**加了 @Transactional 会怎样？**
+
+- 不会报错，但会产生**虚假的安全感**
+- 你以为能整体回滚，实际上做不到
+- 已经提交的数据无法撤销，导致数据不一致
+
+**批量查询为什么必须用 @Transactional？**
+
+- 批量查询是单线程串行执行
+- 复用 Spring 管理的同一个 Executor 和连接
+- 所有分页查询和回调中的写操作都在同一个事务内
+- 任何一批失败 → 异常传播 → Spring 回滚整个事务 ✅
 
 ### 2. 确保数据库支持窗口函数
 
@@ -535,7 +580,94 @@ public class UserService {
 }
 ```
 
-## 🐛 故障排查
+## � 批量查询（Batch Select）
+
+批量查询通过分批加载 + 回调处理的方式**避免大数据量 OOM**。所有分页查询在**同一事务内**串行执行。
+
+### 核心设计
+
+| 特性         | 说明                                    |
+|------------|---------------------------------------|
+| **快照一致性**  | 同一事务 REPEATABLE READ，所有分页数据 == 事务开始时刻 |
+| **原子性**    | 任意一批回调抛异常 → 整体回滚                      |
+| **避免 OOM** | 每批数据处理完即释放，不会一次加载全量                   |
+
+### 基本用法
+
+```java
+import cn.rhymed.data.turbo.BatchSelectHelper;
+import cn.rhymed.data.turbo.config.BatchSelectConfig;
+
+@Service
+public class UserService {
+
+    @Autowired
+    private UserMapper userMapper;
+
+    /**
+     * 分批处理所有用户（默认配置）
+     */
+    @Transactional  // 必须在事务中使用
+    public void processAllUsers() {
+        BatchSelectHelper.execute(() -> userMapper.list(), batch -> {
+            // batch 是当前这一批数据，处理完即释放
+            batch.forEach(user -> sendEmail(user));
+        });
+    }
+
+    /**
+     * 自定义配置
+     */
+    @Transactional
+    public void processWithConfig() {
+        BatchSelectConfig config = BatchSelectConfig.builder()
+                .primaryId("user_id")
+                .fetchSize(1000)
+                .build();
+
+        BatchSelectHelper.execute(config, () -> userMapper.list(), batch -> {
+            batch.forEach(user -> userMapper.updateStatus(user.getId(), "processed"));
+        });
+    }
+
+    /**
+     * 收集全部结果（大数据量慎用）
+     */
+    @Transactional
+    public void collectAll() {
+        List<User> allUsers = BatchSelectHelper.executeAndCollect(() -> userMapper.list());
+    }
+}
+```
+
+### 与原始查询的等价性
+
+```java
+// 原始写法（大数据量会 OOM）
+List<User> all = userMapper.list();
+all.forEach(user -> sendEmail(user));
+
+// 批量查询写法（等价，不会 OOM）
+BatchSelectHelper.execute(() -> userMapper.list(), batch -> {
+    batch.forEach(user -> sendEmail(user));
+});
+```
+
+### BatchSelectConfig 参数
+
+| 参数        | 类型     | 必填 | 说明              |
+|-----------|--------|----|-----------------|
+| primaryId | String | 否  | 主键字段名，不配置则自动推断  |
+| fetchSize | int    | 否  | 每批次查询大小，默认 5000 |
+
+### ⚠️ 批量查询注意事项
+
+1. **必须在 `@Transactional` 中使用**：保证快照一致性和原子性
+2. **回调异常会触发整体回滚**：任意一批处理失败 → 事务回滚
+3. **不支持多线程**：为保证事务一致性，所有分页在同一连接内串行执行
+4. **返回值为 void**：数据通过回调流式处理，不直接返回
+
+## �🐛 故障排查
 
 ### 问题：拦截器没有生效
 

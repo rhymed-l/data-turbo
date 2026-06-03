@@ -21,6 +21,11 @@ public class DataTurboProperties {
      */
     private BatchUpdate batchUpdate = new BatchUpdate();
 
+    /**
+     * 批量查询默认配置
+     */
+    private BatchSelect batchSelect = new BatchSelect();
+
     @Data
     public static class BatchDelete {
         /**
@@ -65,5 +70,18 @@ public class DataTurboProperties {
          * 最大线程数，默认 3
          */
         private int maxThreadCount = 3;
+    }
+
+    @Data
+    public static class BatchSelect {
+        /**
+         * 默认主键字段名
+         */
+        private String primaryId = null;
+
+        /**
+         * 每批次查询大小，默认 5000
+         */
+        private int fetchSize = 5000;
     }
 }
